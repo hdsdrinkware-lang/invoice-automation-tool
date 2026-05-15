@@ -12,30 +12,38 @@ from PIL import Image
 # --- 初始化 OCR 引擎 ---
 @st.cache_resource
 def load_ocr():
-    # 默认加载简中和英文模型
     return easyocr.Reader(['ch_sim', 'en'])
 
 reader = load_ocr()
 
 # --- 配置与常量 ---
 SAVE_DIR = "collected_invoices"
+LOG_FILE = "processed_log.csv"
+
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
+
+if 'processed_nos' not in st.session_state:
+    if os.path.exists(LOG_FILE):
+        try:
+            log_df = pd.read_csv(LOG_FILE)
+            st.session_state.processed_nos = set(log_df['发票号码'].astype(str).tolist())
+        except:
+            st.session_state.processed_nos = set()
+    else:
+        st.session_state.processed_nos = set()
 
 # --- 核心识别逻辑 ---
 
 def extract_text(file):
-    """从 PDF 或图片中提取文本"""
     text = ""
     file_extension = os.path.splitext(file.name)[1].lower()
-    
     if file_extension == ".pdf":
         try:
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
-                    text += page.extract_text() or ""
-            
-            # 如果 PDF 提取不到文字（可能是扫描件 PDF），尝试 OCR
+                    # 针对全电发票，有时表格内容和表头会混在一起，提取时保留布局
+                    text += page.extract_text(layout=True) or ""
             if not text.strip():
                 with pdfplumber.open(file) as pdf:
                     for page in pdf.pages:
@@ -51,187 +59,197 @@ def extract_text(file):
             text = " ".join([res[1] for res in results])
         except Exception as e:
             st.error(f"解析图片出错: {e}")
-    
     return text
 
 def parse_invoice_data(text):
-    """从文本中解析发票关键信息"""
+    """深度解析发票关键信息 (针对全电发票和普通发票优化)"""
     data = {
+        "查重": "OK",
         "发票号码": "未识别",
+        "发票类型": "增值税发票",
+        "开票日期": "未识别",
         "购买方名称": "未识别",
+        "购买方税号": "未识别",
         "销售方名称": "未识别",
-        "项目名称": "未识别",
-        "合计金额": 0.0,
-        "开票日期": "未识别"
+        "销售方税号": "未识别",
+        "销售方银行账号": "未识别",
+        "商品内容": "未识别",
+        "不含税金额": 0.0,
+        "税额": 0.0,
+        "价税合计": 0.0
     }
     
-    if not text:
-        return data
+    if not text: return data
 
-    # 1. 识别发票号码
-    no_match = re.search(r"(?:发票号码|No|NO)[:：]?\s*(\d{8,20})", text, re.I)
-    if no_match:
-        data["发票号码"] = no_match.group(1)
-    
-    # 2. 识别 购买方 和 销售方
-    # 在中文发票中，购买方通常出现在文本的前半部，销售方出现在后半部
-    # 我们先尝试定位“购买方”和“销售方”关键词
-    
-    # 购买方正则
-    buyer_match = re.search(r"购买方[:：]?\s*名称[:：]?\s*([^\n\d]{4,50})", text)
-    if not buyer_match:
-        buyer_match = re.search(r"购买方[:：]?\s*([^\n\d]{4,50})", text)
-    if buyer_match:
-        data["购买方名称"] = buyer_match.group(1).strip()
+    # 1. 发票类型
+    if "电子发票" in text: data["发票类型"] = "电子发票"
+    if "专用发票" in text: data["发票类型"] = "增值税专用发票"
+    elif "普通发票" in text: data["发票类型"] = "增值税普通发票"
+
+    # 2. 发票号码 (全电发票号码通常较长)
+    # 匹配规律：出现在“发票号码：”后，或者是一串 20 位的数字
+    no_match = re.search(r"发票号码[:：]?\s*(\d{20}|\d{12}|\d{10}|\d{8})", text)
+    if not no_match:
+        # 兜底：直接找独立的长数字
+        nos = re.findall(r"\b\d{20}\b", text)
+        if nos: data["发票号码"] = nos[0]
     else:
-        # 如果没找到显式标记，寻找第一个出现的可能的公司名
-        first_name = re.search(r"名称[:：]?\s*([^\n\d]{4,50})", text)
-        if first_name:
-            data["购买方名称"] = first_name.group(1).strip()
+        data["发票号码"] = no_match.group(1)
+        
+    if data["发票号码"] in st.session_state.processed_nos:
+        data["查重"] = "⚠️ 重复"
 
-    # 销售方正则
-    seller_match = re.search(r"销售方[:：]?\s*名称[:：]?\s*([^\n\d]{4,50})", text)
-    if not seller_match:
-        # 寻找第二个出现的“名称”或出现在文本后半段的名称
-        names = re.findall(r"名称[:：]?\s*([^\n\d]{4,50})", text)
-        if len(names) >= 2:
-            data["销售方名称"] = names[-1].strip()
-        else:
-            seller_match = re.search(r"销售方[:：]?\s*([^\n\d]{4,50})", text)
-            if seller_match:
-                data["销售方名称"] = seller_match.group(1).strip()
-
-    # 3. 识别项目名称 (货物或服务名称)
-    # 寻找表格表头后的内容
-    item_match = re.search(r"(?:项目名称|货物或应税劳务、服务名称)[:：]?\s*([^\n]*)", text)
-    if not item_match:
-        # 尝试匹配一些常见的项目后缀
-        item_match = re.search(r"([^\n*]*(?:服务费|材料|软件|咨询|费|劳务|技术)[^\n]*)", text)
-    
-    if item_match:
-        data["项目名称"] = item_match.group(1).strip().replace("*", "")
-
-    # 4. 识别金额
-    amount_patterns = [
-        r"(?:价税合计|小写|Total|TOTAL)[^0-9¥$]*[¥￥$]?\s*([\d\.,]+)",
-        r"[¥￥$]\s*([\d\.,]+)"
-    ]
-    for pattern in amount_patterns:
-        amount_match = re.search(pattern, text, re.I)
-        if amount_match:
-            raw_amt = amount_match.group(1).replace(",", "")
-            try:
-                data["合计金额"] = float(raw_amt)
-                break
-            except:
-                continue
-    
-    # 5. 识别日期
-    date_match = re.search(r"(\d{4}\s*[年/-]\s*\d{1,2}\s*[月/-]\s*\d{1,2}\s*日?)", text)
+    # 3. 日期
+    date_match = re.search(r"(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)", text)
     if date_match:
         data["开票日期"] = re.sub(r'[\s年月日]', '-', date_match.group(1)).strip('-')
-        
+
+    # 4. 购买方 & 销售方 信息
+    # 全电发票特征：名称和税号通常成对出现
+    names = re.findall(r"名称[:：]?\s*([^\n\d*]{4,50})", text)
+    tax_ids = re.findall(r"[A-Z0-9]{15,20}", text)
+    
+    # 尝试根据上下文区分
+    if "购 买 方" in text or "购买方" in text:
+        # 寻找“购买方”后的第一个名称和税号
+        buyer_section = text.split("购买方")[1] if "购买方" in text else text
+        buyer_name = re.search(r"名称[:：]?\s*([^\n\d*]{4,50})", buyer_section)
+        if buyer_name: data["购买方名称"] = buyer_name.group(1).strip()
+        buyer_tax = re.search(r"代码[:：/纳税人识别号]?\s*([A-Z0-9]{18})", buyer_section)
+        if buyer_tax: data["购买方税号"] = buyer_tax.group(1).strip()
+
+    if "销 售 方" in text or "销售方" in text:
+        seller_section = text.split("销售方")[1] if "销售方" in text else text
+        seller_name = re.search(r"名称[:：]?\s*([^\n\d*]{4,50})", seller_section)
+        if seller_name: data["销售方名称"] = seller_name.group(1).strip()
+        seller_tax = re.search(r"代码[:：/纳税人识别号]?\s*([A-Z0-9]{18})", seller_section)
+        if seller_tax: data["销售方税号"] = seller_tax.group(1).strip()
+    
+    # 兜底：如果没定位到 section，用提取到的列表
+    if data["购买方名称"] == "未识别" and len(names) > 0: data["购买方名称"] = names[0].strip()
+    if data["销售方名称"] == "未识别" and len(names) > 1: data["销售方名称"] = names[1].strip()
+    if data["购买方税号"] == "未识别" and len(tax_ids) > 0: data["购买方税号"] = tax_ids[0]
+    if data["销售方税号"] == "未识别" and len(tax_ids) > 1: data["销售方税号"] = tax_ids[1]
+
+    # 5. 银行账号 (销售方)
+    bank_match = re.search(r"银行账号[:：]?\s*(\d{10,25})", text)
+    if bank_match:
+        data["销售方银行账号"] = bank_match.group(1)
+
+    # 6. 商品内容
+    # 提取项目名称列下的内容，通常在“项目名称”和“规格型号”之间
+    item_match = re.search(r"(?:\*([^*]+)\*([^*]+))", text)
+    if item_match:
+        data["商品内容"] = f"*{item_match.group(1)}*{item_match.group(2)}".strip()
+    else:
+        # 兜底：找常见的服务费等字样
+        items = re.findall(r"(\*[^*]+\*[^*]+)", text)
+        if items: data["商品内容"] = items[0]
+
+    # 7. 金额、税额、合计
+    # 价税合计 (小写)
+    total_match = re.search(r"(?:价税合计（小写）|小写)[^0-9¥￥]*[¥￥]?\s*([\d\.]+)", text)
+    if total_match:
+        data["价税合计"] = float(total_match.group(1))
+
+    # 税额
+    tax_match = re.search(r"税\s*额[^0-9¥￥]*[¥￥]?\s*([\d\.]+)", text)
+    if tax_match:
+        data["税额"] = float(tax_match.group(1))
+    elif "免税" in text or "***" in text:
+        data["税额"] = 0.0
+
+    # 不含税金额 (合计金额)
+    subtotal_match = re.search(r"合\s*计[^0-9¥￥]*[¥￥]?\s*([\d\.]+)", text)
+    if subtotal_match:
+        data["不含税金额"] = float(subtotal_match.group(1))
+    else:
+        data["不含税金额"] = data["价税合计"] - data["税额"]
+
     return data
 
-def organize_file(uploaded_file, buyer_name):
-    """按购买方名称自动归集文件"""
-    safe_name = re.sub(r'[\\/:*?"<>|]', '', buyer_name)
-    folder_path = os.path.join(SAVE_DIR, safe_name)
+def organize_file(uploaded_file, info):
+    buyer = re.sub(r'[\\/:*?"<>|]', '', info["购买方名称"])
+    date = info["开票日期"] if info["开票日期"] != "未识别" else "0000-00-00"
+    amt = str(info["价税合计"])
+    inv_no = info["发票号码"]
+    
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    new_filename = f"{date}_{buyer}_{amt}_{inv_no}{ext}"
+    
+    folder_path = os.path.join(SAVE_DIR, buyer)
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
     
-    save_path = os.path.join(folder_path, uploaded_file.name)
+    save_path = os.path.join(folder_path, new_filename)
     with open(save_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    return save_path
+    return save_path, new_filename
 
-# --- UI 界面 ---
+# --- UI ---
+st.set_page_config(page_title="精准发票助手 V5.0", layout="wide", page_icon="🎯")
 
-st.set_page_config(page_title="智能发票归集专家", layout="wide", page_icon="🧾")
+st.title("🎯 精准发票自动识别与归集 V5.0")
+st.markdown("针对全电发票及复杂报销场景深度优化，支持识别：**发票号码、税号、税额、银行账号、商品明细**等。")
 
-st.markdown("""
-    <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
-st.title("🧾 智能发票归集与报销助手 V3.0")
-st.info("💡 已升级：支持购买方、销售方、项目名称的精准拆分识别。")
-
-with st.expander("📁 上传设置与说明", expanded=True):
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded_files = st.file_uploader("支持批量上传 (PDF/图片)", accept_multiple_files=True, type=["pdf", "jpg", "jpeg", "png"])
-    with col2:
-        st.write("**识别字段：**")
-        st.write("- 购买方 (抬头)")
-        st.write("- 销售方 (商家)")
-        st.write("- 项目名称 (明细)")
-        st.write("- 金额 & 日期")
+uploaded_files = st.file_uploader("批量上传发票 (PDF/图片)", accept_multiple_files=True, type=["pdf", "jpg", "jpeg", "png"])
 
 if uploaded_files:
     data_list = []
-    
-    progress_text = "正在深度解析发票内容..."
-    my_bar = st.progress(0, text=progress_text)
+    my_bar = st.progress(0, text="正在深度扫描发票字段...")
     
     for i, file in enumerate(uploaded_files):
         raw_text = extract_text(file)
         info = parse_invoice_data(raw_text)
         
-        # 自动归集 (以购买方为文件夹名)
-        path = organize_file(file, info["购买方名称"])
-        
+        path, new_name = organize_file(file, info)
         info["文件名"] = file.name
-        info["存储路径"] = path
+        info["新文件名"] = new_name
         data_list.append(info)
         
-        my_bar.progress((i + 1) / len(uploaded_files), text=f"已完成 {i+1}/{len(uploaded_files)}")
+        if info["发票号码"] != "未识别":
+            st.session_state.processed_nos.add(info["发票号码"])
+        my_bar.progress((i + 1) / len(uploaded_files))
     
     my_bar.empty()
-    
     df = pd.DataFrame(data_list)
     
-    st.write("### 📊 发票详细信息清单")
-    
-    # 重新排列列顺序，让购买方、销售方、项目名称更醒目
-    column_order = ["发票号码", "购买方名称", "销售方名称", "项目名称", "合计金额", "开票日期", "文件名", "存储路径"]
-    df = df[column_order]
+    # 持久化记录
+    df[["发票号码", "购买方名称", "价税合计", "开票日期"]].to_csv(LOG_FILE, mode='a', header=not os.path.exists(LOG_FILE), index=False)
 
-    edited_df = st.data_editor(
-        df, 
+    st.write("### 🔍 识别结果详细预览")
+    
+    # 调整列顺序
+    cols = ["查重", "发票号码", "发票类型", "开票日期", "购买方名称", "购买方税号", "销售方名称", "销售方税号", "商品内容", "不含税金额", "税额", "价税合计", "销售方银行账号", "新文件名"]
+    df_display = df[cols]
+
+    st.data_editor(
+        df_display,
         column_config={
-            "购买方名称": st.column_config.TextColumn("购买方 (抬头)"),
-            "销售方名称": st.column_config.TextColumn("销售方 (商家)"),
-            "项目名称": st.column_config.TextColumn("购进项目/内容"),
-            "合计金额": st.column_config.NumberColumn("合计金额 (¥)", format="%.2f"),
-            "存储路径": st.column_config.LinkColumn("文件位置")
+            "不含税金额": st.column_config.NumberColumn("金额(不含税)", format="¥ %.2f"),
+            "税额": st.column_config.NumberColumn("税额", format="¥ %.2f"),
+            "价税合计": st.column_config.NumberColumn("价税合计", format="¥ %.2f"),
+            "查重": st.column_config.TextColumn("状态")
         },
-        use_container_width=True,
-        num_rows="dynamic"
+        use_container_width=True
     )
-    
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("处理数量", f"{len(edited_df)} 张")
-    with c2:
-        total = edited_df["合计金额"].sum()
-        st.metric("报销金额总计", f"¥ {total:,.2f}")
-    with c3:
-        excel_name = f"发票报销明细表_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        edited_df.to_excel(excel_name, index=False)
-        with open(excel_name, "rb") as f:
-            st.download_button("📥 导出报销明细 Excel", f, excel_name, "application/vnd.ms-excel", use_container_width=True)
 
-    st.success(f"✅ 文件已按“购买方抬头”自动整理至 `{SAVE_DIR}` 目录下。")
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("处理张数", f"{len(df)} 张")
+    with c2: st.metric("总金额 (含税)", f"¥ {df['价税合计'].sum():,.2f}")
+    with c3:
+        excel_name = f"发票明细汇总_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        df.to_excel(excel_name, index=False)
+        st.download_button("📥 导出报销专用 Excel", open(excel_name, "rb"), excel_name, use_container_width=True)
+
+    st.success(f"已完成！文件已按“购买方名称”归类至 `{SAVE_DIR}`。")
 
 with st.sidebar:
-    st.header("系统管理")
-    if st.button("🗑️ 清空所有已归集文件", use_container_width=True):
-        if os.path.exists(SAVE_DIR):
-            shutil.rmtree(SAVE_DIR)
-            os.makedirs(SAVE_DIR)
-            st.rerun()
+    st.header("系统工具")
+    if st.button("🗑️ 清空所有归集与记录"):
+        if os.path.exists(SAVE_DIR): shutil.rmtree(SAVE_DIR)
+        if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+        st.session_state.processed_nos = set()
+        st.rerun()
     st.divider()
-    st.caption("Accio Work 自动生成 | V3.0")
+    st.caption("Accio Work 深度定制版 V5.0")
