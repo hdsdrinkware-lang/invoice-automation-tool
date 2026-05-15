@@ -275,28 +275,35 @@ with tab_upload:
 with tab_history:
     st.subheader("📜 历史数据管理中心")
     if os.path.exists(LOG_FILE):
-        hist_df = pd.read_csv(LOG_FILE)
-        search = st.text_input("🔍 搜索历史 (公司、号码、商品)")
-        if search:
-            hist_df = hist_df[hist_df.apply(lambda row: row.astype(str).str.contains(search).any(), axis=1)]
-        
-        st.info("💡 提示：双击单元格可修改。修改后务必点击“保存修改”。")
-        edited = st.data_editor(hist_df, num_rows="dynamic", use_container_width=True)
-        
-        c1, c2, c3 = st.columns(3)
-        if c1.button("💾 保存修改", use_container_width=True):
-            edited.to_csv(LOG_FILE, index=False)
-            st.success("已保存！")
-            st.rerun()
-        if c2.button("📥 导出全量历史", use_container_width=True):
-            all_name = "全量历史记录.xlsx"
-            edited.to_excel(all_name, index=False)
-            st.download_button("下载全量表", open(all_name, "rb"), all_name)
-        if c3.button("🗑️ 彻底清空记录", use_container_width=True):
-            if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-            if os.path.exists(SAVE_DIR): shutil.rmtree(SAVE_DIR)
-            st.session_state.processed_nos = set()
-            st.rerun()
+        try:
+            hist_df = pd.read_csv(LOG_FILE)
+            search = st.text_input("🔍 搜索历史 (公司、号码、商品)")
+            if search:
+                hist_df = hist_df[hist_df.apply(lambda row: row.astype(str).str.contains(search).any(), axis=1)]
+            
+            st.info("💡 提示：双击单元格可修改。修改后务必点击“保存修改”。")
+            edited = st.data_editor(hist_df, num_rows="dynamic", use_container_width=True)
+            
+            c1, c2, c3 = st.columns(3)
+            if c1.button("💾 保存修改", use_container_width=True):
+                edited.to_csv(LOG_FILE, index=False)
+                st.success("已保存！")
+                st.rerun()
+            if c2.button("📥 导出全量历史", use_container_width=True):
+                all_name = "全量历史记录.xlsx"
+                edited.to_excel(all_name, index=False)
+                st.download_button("下载全量表", open(all_name, "rb"), all_name)
+            if c3.button("🗑️ 彻底清空记录", use_container_width=True):
+                if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+                if os.path.exists(SAVE_DIR): shutil.rmtree(SAVE_DIR)
+                st.session_state.processed_nos = set()
+                st.rerun()
+        except Exception as e:
+            st.error("⚠️ 历史记录文件格式受损，无法读取。")
+            if st.button("🔧 尝试修复/重置记录文件"):
+                if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
+                st.session_state.processed_nos = set()
+                st.rerun()
     else:
         st.write("目前没有任何历史记录。")
 
