@@ -256,7 +256,8 @@ with tab_upload:
 
         st.write("---")
         st.subheader("第三步：点击下方绿色大按钮导出本次结果")
-        excel_name = f"发票汇总_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        # 修改下载文件名规则为：发票汇总+日期.xlsx
+        excel_name = f"发票汇总{datetime.now().strftime('%Y%m%d')}.xlsx"
         df.to_excel(excel_name, index=False)
         with open(excel_name, "rb") as f:
             st.download_button(
