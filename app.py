@@ -20,32 +20,28 @@ reader = load_ocr()
 SAVE_DIR = "collected_invoices"
 LOG_FILE = "processed_log.csv"
 
-# 确保保存目录存在
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
-# 加载历史记录
-def load_history():
+# 加载历史记录用于查重
+def load_processed_nos():
     if os.path.exists(LOG_FILE):
         try:
-            return pd.read_csv(LOG_FILE)
+            df = pd.read_csv(LOG_FILE)
+            return set(df['发票号码'].astype(str).tolist())
         except:
-            return pd.DataFrame()
-    return pd.DataFrame()
+            return set()
+    return set()
 
 # 初始化 Session State
 if 'processed_nos' not in st.session_state:
-    df_hist = load_history()
-    if not df_hist.empty and '发票号码' in df_hist.columns:
-        st.session_state.processed_nos = set(df_hist['发票号码'].astype(str).tolist())
-    else:
-        st.session_state.processed_nos = set()
+    st.session_state.processed_nos = load_processed_nos()
 
-if 'confirm_upload' not in st.session_state:
-    st.session_state.confirm_upload = False
+if 'current_results' not in st.session_state:
+    st.session_state.current_results = []
 
-if 'pre_results' not in st.session_state:
-    st.session_state.pre_results = []
+if 'show_warning' not in st.session_state:
+    st.session_state.show_warning = False
 
 # --- 核心识别逻辑 ---
 
@@ -84,11 +80,10 @@ def parse_invoice_data(text):
         "银行账号": "未识别",
         "商品内容": "未识别"
     }
-    
     if not text: return data
 
-    # 识别发票号码 (全电发票号码通常较长)
     inv_nos = re.findall(r"\b\d{20}\b", text)
+    if not inv_nos: inv_nos = re.findall(r"\b\d{12}\b", text)
     if inv_nos: data["发票号码"] = inv_nos[0]
     
     tax_ids = re.findall(r"\b[A-Z0-9]{18}\b", text)
@@ -160,161 +155,153 @@ def organize_file(uploaded_file, info):
     return save_path, new_filename
 
 # --- UI ---
-st.set_page_config(page_title="智能发票助手 V7.5", layout="wide", page_icon="🧾")
+st.set_page_config(page_title="精准发票专家 V8.0", layout="wide", page_icon="🧾")
 
-# 自定义 CSS 放大下载按钮
 st.markdown("""
     <style>
     div.stDownloadButton > button {
         width: 100%;
-        height: 80px !important;
-        font-size: 24px !important;
-        background-color: #007bff !important;
+        height: 100px !important;
+        font-size: 28px !important;
+        font-weight: bold !important;
+        background-color: #28a745 !important;
         color: white !important;
-        border-radius: 10px !important;
-        border: none !important;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        border-radius: 15px !important;
+        box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+        margin-top: 20px;
     }
     div.stDownloadButton > button:hover {
-        background-color: #0056b3 !important;
+        background-color: #218838 !important;
+        transform: scale(1.02);
+    }
+    .step-box {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        border-left: 5px solid #28a745;
+        margin-bottom: 20px;
     }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🧾 智能发票归集专家 V7.5")
+st.title("🧾 智能发票归集专家 V8.0")
 
-tab_upload, tab_history = st.tabs(["📤 上传发票", "📜 历史记录"])
+tab_upload, tab_history = st.tabs(["📤 上传发票", "📜 历史记录管理"])
 
 with tab_upload:
-    uploaded_files = st.file_uploader("批量上传发票 (PDF/图片)", accept_multiple_files=True, type=["pdf", "jpg", "jpeg", "png"])
+    st.markdown("""
+    <div class="step-box">
+    <b>使用流程：</b><br>
+    1. <b>上传</b>：拖入发票文件 -> 2. <b>识别</b>：点击“开始批量识别” -> 3. <b>下载</b>：点击下方绿色大按钮下载 Excel -> 4. <b>完成</b>：点击“完成处理”
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader("第一步：批量上传发票 (支持多选)", accept_multiple_files=True, type=["pdf", "jpg", "jpeg", "png"])
 
     if uploaded_files:
-        if not st.session_state.confirm_upload:
-            duplicates = []
-            st.session_state.pre_results = []
-            
-            with st.status("正在进行查重预检...", expanded=True) as status:
-                for file in uploaded_files:
-                    text = extract_text(file)
-                    inv_no_match = re.search(r"\b\d{20}\b", text)
-                    if inv_no_match:
-                        inv_no = inv_no_match.group(0)
-                        if str(inv_no) in st.session_state.processed_nos:
-                            duplicates.append(f"{file.name} (发票号: {inv_no})")
-                    # 保存预处理结果到 Session State
-                    st.session_state.pre_results.append({"name": file.name, "text": text, "buffer": file.getbuffer()})
-                status.update(label="预检完成", state="complete")
-
-            if duplicates:
-                st.error(f"🚨 检测到 {len(duplicates)} 张发票已在记录中！")
-                for dup in duplicates:
-                    st.write(f"- {dup}")
-                
-                c1, c2 = st.columns(2)
-                if c1.button("✅ 确定：包含重复项继续上传", use_container_width=True, type="primary"):
-                    st.session_state.confirm_upload = True
-                    st.rerun()
-                if c2.button("❌ 取消：不上传重复项", use_container_width=True):
-                    st.session_state.confirm_upload = False
-                    st.session_state.pre_results = []
-                    st.rerun()
-            else:
-                st.session_state.confirm_upload = True
-                st.rerun()
-
-        # 处理并展示结果
-        if st.session_state.confirm_upload and st.session_state.pre_results:
+        if st.button("第二步：开始批量识别内容", type="primary", use_container_width=True):
             data_list = []
-            my_bar = st.progress(0, text="正在解析数据...")
+            has_dup = False
+            dup_details = []
             
-            for i, res in enumerate(st.session_state.pre_results):
-                raw_text = res["text"]
-                info = parse_invoice_data(raw_text)
-                
-                # 模拟 uploaded_file 对象用于保存
-                class MockFile:
-                    def __init__(self, name, buffer):
-                        self.name = name
-                        self.buffer = buffer
-                    def getbuffer(self):
-                        return self.buffer
-                
-                mock_file = MockFile(res["name"], res["buffer"])
-                path, new_name = organize_file(mock_file, info)
+            my_bar = st.progress(0, text="全速识别中...")
+            for i, file in enumerate(uploaded_files):
+                text = extract_text(file)
+                info = parse_invoice_data(text)
+                path, new_name = organize_file(file, info)
                 
                 info["上传时间"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                info["文件名"] = res["name"]
+                info["文件名"] = file.name
                 info["存储路径"] = path
                 data_list.append(info)
                 
-                if info["发票号码"] != "未识别":
-                    st.session_state.processed_nos.add(str(info["发票号码"]))
-                my_bar.progress((i + 1) / len(st.session_state.pre_results))
+                if info["查重"] == "⚠️ 重复":
+                    has_dup = True
+                    dup_details.append(f"{file.name} (号: {info['发票号码']})")
+                
+                my_bar.progress((i + 1) / len(uploaded_files))
             
+            st.session_state.current_results = data_list
+            st.session_state.show_warning = has_dup
+            if has_dup:
+                st.session_state.dup_list = dup_details
             my_bar.empty()
-            df = pd.DataFrame(data_list)
+            st.rerun()
+
+    if st.session_state.current_results:
+        if st.session_state.show_warning:
+            st.error(f"🚨 注意：检测到 {len(st.session_state.dup_list)} 张重复发票！")
+            with st.expander("点击查看重复清单"):
+                for d in st.session_state.dup_list:
+                    st.write(f"- {d}")
+        
+        st.write("### ✅ 识别结果汇总")
+        df = pd.DataFrame(st.session_state.current_results)
+        cols = ["查重", "发票号码", "开票日期", "购买方名称", "购买方税号", "销售方名称", "销售方税号", "金额", "税额", "价税合计", "商品内容"]
+        st.dataframe(df[cols], use_container_width=True)
+        
+        # 保存到历史 (仅在识别完成后立即保存一次)
+        if st.button("确认以上信息并存入数据库", use_container_width=True):
+            # 更新已处理集合
+            for res in st.session_state.current_results:
+                if res["发票号码"] != "未识别":
+                    st.session_state.processed_nos.add(str(res["发票号码"]))
             
-            # 保存到历史记录
+            # 写入 CSV
             if os.path.exists(LOG_FILE):
                 df.to_csv(LOG_FILE, mode='a', header=False, index=False)
             else:
                 df.to_csv(LOG_FILE, index=False)
+            st.success("数据已入库！现在可以下载了。")
 
-            st.write("### ✅ 处理结果汇总")
-            cols = ["查重", "发票号码", "开票日期", "购买方名称", "购买方税号", "销售方名称", "销售方税号", "金额", "税额", "价税合计", "商品内容", "银行账号"]
-            st.dataframe(df[cols], use_container_width=True)
-            
-            # 放大导出按钮
-            st.write("---")
-            st.subheader("🔥 汇总完成！请点击下方蓝色大按钮导出 Excel")
-            excel_name = f"本次处理汇总_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            df.to_excel(excel_name, index=False)
-            with open(excel_name, "rb") as f:
-                st.download_button(
-                    label=f"📥 立即导出本次处理的 {len(df)} 张发票汇总表",
-                    data=f,
-                    file_name=excel_name,
-                    mime="application/vnd.ms-excel",
-                    use_container_width=True
-                )
-            
-            if st.button("完成处理 (清空当前列表)", use_container_width=True):
-                st.session_state.confirm_upload = False
-                st.session_state.pre_results = []
-                st.rerun()
+        st.write("---")
+        st.subheader("第三步：点击下方绿色大按钮导出本次结果")
+        excel_name = f"发票汇总_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        df.to_excel(excel_name, index=False)
+        with open(excel_name, "rb") as f:
+            st.download_button(
+                label=f"📥 立即导出本次识别的 {len(df)} 张发票明细表",
+                data=f,
+                file_name=excel_name,
+                mime="application/vnd.ms-excel"
+            )
+        
+        st.write("---")
+        if st.button("第四步：完成处理 (清空当前工作区)", use_container_width=True):
+            st.session_state.current_results = []
+            st.session_state.show_warning = False
+            st.rerun()
 
 with tab_history:
-    st.subheader("📜 历史上传记录管理")
-    hist_df = load_history()
-    if not hist_df.empty:
-        search_query = st.text_input("🔍 快速搜索 (支持公司名、税号、发票号等)")
-        if search_query:
-            hist_df = hist_df[hist_df.apply(lambda row: row.astype(str).str.contains(search_query).any(), axis=1)]
+    st.subheader("📜 历史数据管理中心")
+    if os.path.exists(LOG_FILE):
+        hist_df = pd.read_csv(LOG_FILE)
+        search = st.text_input("🔍 搜索历史 (公司、号码、商品)")
+        if search:
+            hist_df = hist_df[hist_df.apply(lambda row: row.astype(str).str.contains(search).any(), axis=1)]
         
-        st.info("💡 提示：您可以直接在下表中双击单元格进行修改。修改后请点击下方的“保存修改”按钮。")
-        edited_hist = st.data_editor(hist_df, num_rows="dynamic", use_container_width=True, key="history_editor")
+        st.info("💡 提示：双击单元格可修改。修改后务必点击“保存修改”。")
+        edited = st.data_editor(hist_df, num_rows="dynamic", use_container_width=True)
         
-        col_save, col_dl, col_clear = st.columns(3)
-        if col_save.button("💾 保存所有修改", use_container_width=True):
-            edited_hist.to_csv(LOG_FILE, index=False)
-            st.success("历史记录已更新！")
+        c1, c2, c3 = st.columns(3)
+        if c1.button("💾 保存修改", use_container_width=True):
+            edited.to_csv(LOG_FILE, index=False)
+            st.success("已保存！")
             st.rerun()
-            
-        if col_dl.button("📥 导出历史全量 Excel", use_container_width=True):
-            excel_name = f"全量发票历史_{datetime.now().strftime('%Y%m%d')}.xlsx"
-            edited_hist.to_excel(excel_name, index=False)
-            st.download_button("点击下载全量表", open(excel_name, "rb"), excel_name)
-            
-        if col_clear.button("🗑️ 清空所有记录", use_container_width=True):
+        if c2.button("📥 导出全量历史", use_container_width=True):
+            all_name = "全量历史记录.xlsx"
+            edited.to_excel(all_name, index=False)
+            st.download_button("下载全量表", open(all_name, "rb"), all_name)
+        if c3.button("🗑️ 彻底清空记录", use_container_width=True):
             if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
             if os.path.exists(SAVE_DIR): shutil.rmtree(SAVE_DIR)
             st.session_state.processed_nos = set()
             st.rerun()
     else:
-        st.write("暂无历史记录。")
+        st.write("目前没有任何历史记录。")
 
 with st.sidebar:
-    st.header("系统状态")
-    st.write(f"数据库记录: {len(st.session_state.processed_nos)} 条")
+    st.header("系统概览")
+    st.write(f"累计处理发票: {len(st.session_state.processed_nos)} 张")
     st.divider()
-    st.caption("Accio Work V7.5 | 修正增强版")
+    st.caption("Accio Work 稳定版 V8.0")
